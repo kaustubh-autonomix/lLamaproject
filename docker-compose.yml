@@ -1,0 +1,17 @@
+version: '3.4'
+
+services:
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    container_name: weaviate
+    ports:
+      - "4560:8080"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "./data"
+      ENABLE_MODULES: "none"
+      DEFAULT_VECTORIZER_MODULE: "none"
+    volumes:
+      - ./weaviate_data:/var/lib/weaviate
+    restart: unless-stopped
