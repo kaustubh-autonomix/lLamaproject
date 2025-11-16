@@ -46,7 +46,7 @@ from config import (
 
 # Beacon and PDF path config
 BEACON_HOST = WEAVIATE_URL.replace("https://", "").replace("http://", "").strip("/")
-PDF_PATH = "/Users/apple/Desktop/lLamaproject/postgresql18docs-for-training.pdf"
+PDF_PATH = "/Users/apple/Desktop/lLamaproject/file-example_PDF_500_kB.pdf"
 from logger import logger
 
 
@@ -136,36 +136,64 @@ def file_checksum(path: str) -> str:
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
-    url = "https://api.generative.googleapis.com/v1/embeddings:embed"
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "gemini-embeddings-1.0", "input": texts}
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    embeddings = [item['embedding'] for item in data['data']]
-    return embeddings
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
+
+    headers = {"Content-Type": "application/json"}
+
+    responses = []
+
+    for t in texts:
+        payload = {
+            "model": "models/text-embedding-004",
+            "content": {
+                "parts": [
+                    {"text": t}
+                ]
+            }
+        }
+
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+
+        data = r.json()
+
+        embedding = data.get("embedding", {}).get("values", [])
+        responses.append(embedding)
+
+    return responses
 # Gemini generator wrapper (used for KG extraction and answer generation)
 def generate_from_gemini(prompt: str, max_tokens: int = 1024) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
-    url = "https://api.generative.googleapis.com/v1/answers:generate"
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gemini-2.5-flash",
-        "prompt": prompt,
-        "maxOutputTokens": max_tokens,
-        "temperature": 0.0
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    if 'candidates' in data:
-        return data['candidates'][0].get('content', '')
-    if 'output' in data:
-        return "\n".join([o.get('content', '') for o in data['output']])
-    return str(data)
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": max_tokens
+        }
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    r = requests.post(url, json=payload, headers=headers, timeout=120)
+    r.raise_for_status()
+
+    data = r.json()
+
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except:
+        return str(data)
 # upsert vectors (same as before)
 def upsert_documents(source: str, chunks: List[str]):
     embeddings = embed_texts(chunks)
@@ -331,8 +359,7 @@ if __name__ == "__main__":
 
     # Step 2: KG extraction
     print("[2/3] Extracting Knowledge Graph...")
-    loop = asyncio.get_event_loop()
-    kg_result = loop.run_until_complete(extract_and_store_kg("hardcoded_pdf", PDF_PATH))
+    kg_result = asyncio.run(extract_and_store_kg("hardcoded_pdf", PDF_PATH))
     print(f"KG Extraction Status: {kg_result['status']}")
 
     # Step 3: Query loop
