@@ -43,6 +43,10 @@ from config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
 )
+
+# Beacon and PDF path config
+BEACON_HOST = WEAVIATE_URL.replace("https://", "").replace("http://", "").strip("/")
+PDF_PATH = "/Users/apple/Desktop/lLamaproject/postgresql18docs-for-training.pdf"
 from logger import logger
 
 
@@ -55,6 +59,7 @@ client = weaviate.Client(
 )
 
 # Ensure core classes exist (Document) and KG classes
+
 def ensure_core_schema():
     schema = client.schema.get()
     classes = [c['class'] for c in schema.get('classes', [])]
@@ -232,7 +237,13 @@ def upsert_relation(from_canonical: str, to_canonical: str, relation_type: str, 
         return None
     from_id = from_objs[0]['_additional']['id']
     to_id = to_objs[0]['_additional']['id']
-    relation_obj = {"relation_type": relation_type, "evidence_chunks": evidence_chunks, "confidence": confidence, "from": {"beacon": f"weaviate://localhost/{from_id}"}, "to": {"beacon": f"weaviate://localhost/{to_id}"}}
+    relation_obj = {
+        "relation_type": relation_type,
+        "evidence_chunks": evidence_chunks,
+        "confidence": confidence,
+        "from": {"beacon": f"weaviate://{BEACON_HOST}/{from_id}"},
+        "to": {"beacon": f"weaviate://{BEACON_HOST}/{to_id}"}
+    }
     oid = client.data_object.create(relation_obj, "KG_Relation")
     return oid
 
@@ -305,91 +316,36 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[str]
 
-# FastAPI app
-app = FastAPI(title="RAG-KG-Service")
 
-@app.on_event("startup")
-async def startup_event():
+# CLI mode for PDF ingestion, KG extraction, and interactive query
+if __name__ == "__main__":
+    # Initialize schema
     ensure_core_schema()
 
-@app.post("/ingest/file", response_model=IngestResponse)
-async def ingest_file(file: UploadFile = File(...), source: str = Form(None)):
-    filename = file.filename
-    dest = f"/tmp/{uuid.uuid4().hex}_{filename}"
-    contents = await file.read()
-    with open(dest, "wb") as f:
-        f.write(contents)
-    text = extract_text_from_pdf(dest)
+    # Step 1: Ingest hardcoded PDF
+    print("[1/3] Ingesting PDF...")
+    text = extract_text_from_pdf(PDF_PATH)
     chunks = chunk_text(text)
-    upsert_documents(source or filename, chunks)
-    return {"status": "ok", "inserted": len(chunks)}
+    upsert_documents("hardcoded_pdf", chunks)
+    print(f"Ingestion complete: {len(chunks)} chunks inserted.")
 
-@app.post("/ingest/path", response_model=IngestResponse)
-def ingest_path(path: str, source: str = None):
-    text = extract_text_from_pdf(path)
-    chunks = chunk_text(text)
-    upsert_documents(source or path, chunks)
-    return {"status": "ok", "inserted": len(chunks)}
+    # Step 2: KG extraction
+    print("[2/3] Extracting Knowledge Graph...")
+    loop = asyncio.get_event_loop()
+    kg_result = loop.run_until_complete(extract_and_store_kg("hardcoded_pdf", PDF_PATH))
+    print(f"KG Extraction Status: {kg_result['status']}")
 
-@app.post("/ingest/kg-trigger", response_model=KGResponse)
-async def kg_trigger(path: str = Form(...), doc_name: str = Form(...)):
-    # asynchronous background extraction
-    task = asyncio.create_task(extract_and_store_kg(doc_name, path))
-    res = await task
-    return {"status": res.get('status'), "checksum": res.get('checksum')}
-
-@app.post("/session/start")
-def session_start():
-    sid = uuid.uuid4().hex
-    SESSIONS[sid] = {"history": []}
-    return {"session_id": sid}
-
-@app.post("/session/{sid}/query", response_model=QueryResponse)
-def session_query(sid: str, q: str, mode: str = Form('hybrid'), top_k: int = Form(5), max_hops: int = Form(2)):
-    if sid not in SESSIONS:
-        raise HTTPException(status_code=404, detail="session not found")
-    # append to history
-    SESSIONS[sid]['history'].append({"user": q})
-    # hybrid retrieval
-    # 1) graph seed entities
-    # simple entity lookup by name
-    graph_contexts = []
-    try:
-        gql = {
-            "query": "{ Get { KG_Entity(where: {path:[\"name\"], operator: Equal, valueString: \"%s\"}) { name canonical_id source_chunks outgoing: KG_Relation { relation_type confidence to { name canonical_id source_chunks } evidence_chunks } } } }" % q
-        }
-        # use client.query.raw to run custom GraphQL
-        raw = client.query.raw(gql['query'])
-        # parse entities
-        data = raw.get('data', {}).get('Get', {}).get('KG_Entity') or []
-        for ent in data:
-            # collect outgoing relations up to max_hops (simplified to depth 1 here)
-            for rel in ent.get('outgoing', []) or []:
-                graph_contexts.append({"path": f"{ent.get('name')} -> {rel.get('relation_type')} -> {rel.get('to', {}).get('name')}", "evidence": rel.get('evidence_chunks', [])})
-    except Exception:
-        graph_contexts = []
-    # 2) vector retrieval
-    vec_hits = query_weaviate_vectors(q, top_k=top_k)
-    # 3) fuse
-    contexts = []
-    sources = []
-    for g in graph_contexts:
-        contexts.append(f"GRAPH: {g['path']} | evidence: {','.join(g['evidence'])}")
-    for h in vec_hits:
-        contexts.append(h['text'])
-        sources.append(h['chunk_id'])
-    context_block = "\n---\n".join(contexts[:10])
-    prompt = f"You are an assistant. Use only the following contexts (GRAPH paths followed by text chunks).\nCONTEXTS:\n{context_block}\n\nQUESTION:\n{q}\n\nAnswer concisely and cite chunk ids. If unknown, say 'I don't know'."
-    answer = generate_from_gemini(prompt)
-    SESSIONS[sid]['history'].append({"assistant": answer})
-    return {"answer": answer, "sources": sources}
-
-@app.post("/session/{sid}/end")
-def session_end(sid: str):
-    if sid in SESSIONS:
-        del SESSIONS[sid]
-    return {"status": "ended"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("trying_Llama_Index:app", host="0.0.0.0", port=8000, reload=False)
+    # Step 3: Query loop
+    print("\n[3/3] Entering interactive query mode. Type 'exit' to stop.\n")
+    while True:
+        q = input("Query> ").strip()
+        if q.lower() == "exit":
+            print("Exiting.")
+            break
+        # hybrid retrieval
+        vec_hits = query_weaviate_vectors(q, top_k=5)
+        contexts = [h['text'] for h in vec_hits]
+        context_block = "\n---\n".join(contexts[:10])
+        prompt = f"Use only the following context to answer.\nCONTEXT:\n{context_block}\n\nQUESTION: {q}\nAnswer concisely."
+        answer = generate_from_gemini(prompt)
+        print(f"Answer: {answer}\n")
